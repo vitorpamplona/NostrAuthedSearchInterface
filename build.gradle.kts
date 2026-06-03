@@ -11,7 +11,8 @@ version = "0.1.0"
 
 repositories {
     mavenCentral()
-    google() // quartz-jvm pulls androidx.sqlite (KMP), published on Google's Maven repo
+    google() // quartz pulls androidx.sqlite (KMP), published on Google's Maven repo
+    maven { url = uri("https://jitpack.io") } // Quartz built from amethyst main
 }
 
 val ktorVersion = "3.0.3"
@@ -32,9 +33,9 @@ dependencies {
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
 
-    // Nostr toolkit (event model, NIP-01 serialization/verification, NIP-42 auth events) —
-    // Quartz, the same library Amethyst uses. Brings its secp256k1 schnorr backend with it.
-    implementation("com.vitorpamplona.quartz:quartz:1.11.0")
+    // Nostr toolkit — Quartz built from amethyst main via JitPack, which ships the new
+    // relay-server engine + Flow<Event> REQ-responder. Brings its secp256k1 backend with it.
+    implementation("com.github.vitorpamplona.amethyst:quartz:3db3037f92")
 
     // Logging
     implementation("ch.qos.logback:logback-classic:1.5.12")

@@ -121,7 +121,9 @@ docker run -p 8080:8080 -e BACKEND_BASE_URL=... nostr-search-redirector
     `ClosedMessage`/`NoticeMessage`/`AuthMessage`) serialized via `JacksonMapper.toJson`.
   - Events: `EventHasher` for NIP-01 id hashing, `event.verify()` for BIP-340 schnorr, and the
     `RelayAuthEvent` (kind 22242) model for NIP-42.
-  - Quartz is a Kotlin Multiplatform library; its JVM variant transitively needs
-    `androidx.sqlite`, so the build adds Google's Maven repo (`google()`), and it requires
-    Kotlin 2.3.x (Quartz 1.11.0 is compiled with 2.3.0 metadata).
+  - Quartz is pulled from **amethyst `main` via JitPack** (`com.github.vitorpamplona.amethyst:quartz`,
+    pinned to a commit) to get the latest relay-server tooling. It's a Kotlin Multiplatform
+    library whose JVM variant transitively needs `androidx.sqlite`, so the build adds Google's
+    Maven repo (`google()`) and the JitPack repo, and requires Kotlin 2.3.x (Quartz's metadata
+    is compiled with 2.3.0).
 - A shared Ktor CIO HTTP client pools connections to the backend across all sockets.
