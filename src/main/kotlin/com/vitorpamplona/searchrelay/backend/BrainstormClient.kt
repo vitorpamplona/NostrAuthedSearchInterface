@@ -16,9 +16,6 @@ import io.ktor.http.contentType
 import io.ktor.http.isSuccess
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.add
-import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.doubleOrNull
@@ -49,10 +46,10 @@ class BrainstormClient(private val config: Config) : AutoCloseable {
 
     /**
      * Calls GET /search/byText and converts each profile hit into a synthesized kind-0
-     * metadata event. The events are UNSIGNED (sig = "") because the search index stores
+     * metadata Event. The events are UNSIGNED (sig = "") because the search index stores
      * indexed profile fields, not the original signed events.
      */
-    suspend fun searchProfiles(text: String, ownPubkey: Boolean, jwt: String?): List<JsonObject> {
+    suspend fun searchProfiles(text: String, ownPubkey: Boolean, jwt: String?): List<Event> {
         val url = buildString {
             append(config.backendBaseUrl)
             append("/search/byText?text=")
@@ -98,8 +95,8 @@ class BrainstormClient(private val config: Config) : AutoCloseable {
         }
     }
 
-    /** Builds a kind-0 metadata event JSON object from a single search result. */
-    private fun toMetadataEvent(result: JsonObject): JsonObject {
+    /** Builds an UNSIGNED kind-0 metadata Event from a single search result. */
+    private fun toMetadataEvent(result: JsonObject): Event {
         val pubkey = result["pubkey"]?.jsonPrimitive?.contentOrNull ?: ""
         val createdAt = System.currentTimeMillis() / 1000
 
@@ -115,31 +112,15 @@ class BrainstormClient(private val config: Config) : AutoCloseable {
         }
         val content = metadata.toString()
 
-        val tags = buildJsonArray {
-            result["documentid"]?.jsonPrimitive?.contentOrNull?.let {
-                add(buildJsonArray { add("documentid"); add(it) })
-            }
-            result["_relevance"]?.jsonPrimitive?.doubleOrNull?.let {
-                add(buildJsonArray { add("relevance"); add(it.toString()) })
-            }
-            result["_quality_score"]?.jsonPrimitive?.doubleOrNull?.let {
-                add(buildJsonArray { add("quality_score"); add(it.toString()) })
-            }
-        }
+        // Carry the search-only signals as tags so clients can sort/inspect them.
+        val tags = ArrayList<Array<String>>(3)
+        result["documentid"]?.jsonPrimitive?.contentOrNull?.let { tags.add(arrayOf("documentid", it)) }
+        result["_relevance"]?.jsonPrimitive?.doubleOrNull?.let { tags.add(arrayOf("relevance", it.toString())) }
+        result["_quality_score"]?.jsonPrimitive?.doubleOrNull?.let { tags.add(arrayOf("quality_score", it.toString())) }
+        val tagArray = tags.toTypedArray()
 
-        val tagArray = tags.map { tag -> tag.jsonArray.map { it.jsonPrimitive.content }.toTypedArray() }
-            .toTypedArray()
         val id = EventHasher.hashId(pubkey, createdAt, 0, tagArray, content)
-
-        return buildJsonObject {
-            put("id", id)
-            put("pubkey", pubkey)
-            put("created_at", createdAt)
-            put("kind", 0)
-            put("tags", tags)
-            put("content", content)
-            put("sig", "") // unsigned: the search index has no original signature
-        }
+        return Event(id, pubkey, createdAt, 0, tagArray, content, "")
     }
 
     private fun kotlinx.serialization.json.JsonObjectBuilder.copyString(src: JsonObject, key: String) {

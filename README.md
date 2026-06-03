@@ -113,10 +113,15 @@ docker run -p 8080:8080 -e BACKEND_BASE_URL=... nostr-search-redirector
 - **Stack:** Kotlin + Ktor (Netty engine). Connections are coroutine-driven and each search
   is a one-shot non-blocking backend call — there are no long-lived subscriptions to track,
   so idle connections are cheap and the service holds many thousands of sockets.
-- **Nostr:** event parsing (`Event.fromJson`), NIP-01 id hashing (`EventHasher`), BIP-340
-  schnorr verification (`event.verify()`) and the NIP-42 `RelayAuthEvent` model all come from
-  **Quartz** (`com.vitorpamplona.quartz:quartz`), the same toolkit Amethyst uses. Quartz is a
-  Kotlin Multiplatform library; its JVM variant transitively needs `androidx.sqlite`, so the
-  build adds Google's Maven repo (`google()`). Building requires Kotlin 2.3.x (Quartz 1.11.0
-  is compiled with 2.3.0 metadata).
+- **Nostr:** the entire protocol layer is **Quartz** (`com.vitorpamplona.quartz:quartz`), the
+  toolkit Amethyst uses — we don't hand-roll any of it:
+  - Wire messages: `JacksonMapper.fromJsonToCommand` parses client `REQ`/`AUTH`/`CLOSE` into
+    Quartz's `Command` model (`ReqCmd`/`AuthCmd`/`CloseCmd`, with `Filter.search` for NIP-50);
+    replies are Quartz `Message` objects (`EventMessage`/`EoseMessage`/`OkMessage`/
+    `ClosedMessage`/`NoticeMessage`/`AuthMessage`) serialized via `JacksonMapper.toJson`.
+  - Events: `EventHasher` for NIP-01 id hashing, `event.verify()` for BIP-340 schnorr, and the
+    `RelayAuthEvent` (kind 22242) model for NIP-42.
+  - Quartz is a Kotlin Multiplatform library; its JVM variant transitively needs
+    `androidx.sqlite`, so the build adds Google's Maven repo (`google()`), and it requires
+    Kotlin 2.3.x (Quartz 1.11.0 is compiled with 2.3.0 metadata).
 - A shared Ktor CIO HTTP client pools connections to the backend across all sockets.

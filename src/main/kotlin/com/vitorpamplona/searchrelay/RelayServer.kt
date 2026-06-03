@@ -1,8 +1,18 @@
 package com.vitorpamplona.searchrelay
 
+import com.vitorpamplona.quartz.nip01Core.core.OptimizedSerializable
+import com.vitorpamplona.quartz.nip01Core.jackson.JacksonMapper
+import com.vitorpamplona.quartz.nip01Core.relay.commands.toClient.AuthMessage
+import com.vitorpamplona.quartz.nip01Core.relay.commands.toClient.ClosedMessage
+import com.vitorpamplona.quartz.nip01Core.relay.commands.toClient.EoseMessage
+import com.vitorpamplona.quartz.nip01Core.relay.commands.toClient.EventMessage
+import com.vitorpamplona.quartz.nip01Core.relay.commands.toClient.NoticeMessage
+import com.vitorpamplona.quartz.nip01Core.relay.commands.toClient.OkMessage
+import com.vitorpamplona.quartz.nip01Core.relay.commands.toRelay.AuthCmd
+import com.vitorpamplona.quartz.nip01Core.relay.commands.toRelay.CloseCmd
+import com.vitorpamplona.quartz.nip01Core.relay.commands.toRelay.ReqCmd
 import com.vitorpamplona.searchrelay.backend.BrainstormClient
 import com.vitorpamplona.searchrelay.nostr.Nip42
-import com.vitorpamplona.searchrelay.nostr.Protocol
 import io.ktor.websocket.DefaultWebSocketSession
 import io.ktor.websocket.Frame
 import io.ktor.websocket.readText
@@ -20,9 +30,10 @@ import java.util.concurrent.atomic.AtomicLong
  * into a backend HTTP call and the hits are streamed back as EVENT + EOSE. There are no
  * long-lived subscriptions to track, which keeps each idle connection cheap.
  *
- * NIP-42 authentication is bound to the connection: every socket is greeted with its own
- * fresh challenge and must AUTH against it. The backend JWT is held by the relay only for
- * the life of that connection — a reconnect gets a new challenge and must AUTH again.
+ * Wire parsing/serialization uses Quartz's relay command model (`Command` / `Message` via
+ * `JacksonMapper`); NIP-42 authentication is bound to the connection: every socket is greeted
+ * with its own fresh challenge and must AUTH against it. The backend JWT is held by the relay
+ * only for the life of that connection — a reconnect gets a new challenge and must AUTH again.
  */
 class RelayServer(
     private val config: Config,
@@ -50,7 +61,8 @@ class RelayServer(
         fun authenticated(now: Instant = Instant.now()): Boolean =
             jwt != null && (jwtExpiresAt?.isAfter(now) ?: true)
 
-        suspend fun send(text: String) = sendLock.withLock { session.send(text) }
+        suspend fun send(message: OptimizedSerializable) =
+            sendLock.withLock { session.send(JacksonMapper.toJson(message)) }
     }
 
     suspend fun handle(session: DefaultWebSocketSession) {
@@ -59,13 +71,13 @@ class RelayServer(
         try {
             // NIP-42: greet the client with an auth challenge straight away. Clients that
             // don't care about authenticated results may simply ignore it.
-            conn.send(Protocol.auth(conn.challenge))
+            conn.send(AuthMessage(conn.challenge))
 
             for (frame in session.incoming) {
                 if (frame !is Frame.Text) continue
                 val text = frame.readText()
                 if (text.length.toLong() > config.maxFrameSize) {
-                    conn.send(Protocol.notice("message too large"))
+                    conn.send(NoticeMessage("error: message too large"))
                     continue
                 }
                 route(conn, text)
@@ -78,25 +90,28 @@ class RelayServer(
     }
 
     private suspend fun route(conn: Connection, text: String) {
-        when (val msg = Protocol.parse(text)) {
-            is Protocol.Inbound.Req -> handleReq(conn, msg)
-            is Protocol.Inbound.Auth -> handleAuth(conn, msg)
-            is Protocol.Inbound.Close -> { /* no long-lived subscriptions to cancel */ }
-            is Protocol.Inbound.Unsupported ->
-                conn.send(Protocol.notice("unsupported message type: ${msg.verb}"))
-            is Protocol.Inbound.Malformed ->
-                conn.send(Protocol.notice("invalid message: ${msg.error}"))
+        val command = try {
+            JacksonMapper.fromJsonToCommand(text)
+        } catch (e: Exception) {
+            conn.send(NoticeMessage("invalid: could not parse message"))
+            return
+        }
+        when (command) {
+            is ReqCmd -> handleReq(conn, command)
+            is AuthCmd -> handleAuth(conn, command)
+            is CloseCmd -> { /* one-shot search: no long-lived subscription to cancel */ }
+            else -> conn.send(NoticeMessage("unsupported: ${command.label()} is not served by this relay"))
         }
     }
 
-    private suspend fun handleReq(conn: Connection, req: Protocol.Inbound.Req) {
+    private suspend fun handleReq(conn: Connection, req: ReqCmd) {
         // If the JWT minted earlier on this connection has since expired, drop it and tell the
         // client to AUTH again; the search then proceeds anonymously.
         if (conn.pubkey != null && !conn.authenticated()) {
             conn.pubkey = null
             conn.jwt = null
             conn.jwtExpiresAt = null
-            conn.send(Protocol.notice("auth-required: session expired, please AUTH again"))
+            conn.send(NoticeMessage("auth-required: session expired, please AUTH again"))
         }
         val authed = conn.authenticated()
 
@@ -107,29 +122,25 @@ class RelayServer(
             val limit = filter.limit?.coerceIn(1, config.maxResults) ?: config.maxResults
 
             val hits = try {
-                backend.searchProfiles(
-                    text = term,
-                    ownPubkey = authed,
-                    jwt = conn.jwt,
-                )
+                backend.searchProfiles(text = term, ownPubkey = authed, jwt = conn.jwt)
             } catch (e: Exception) {
                 log.warn("search failed for '{}': {}", term, e.message)
-                conn.send(Protocol.closed(req.subscriptionId, "error: search backend unavailable"))
+                conn.send(ClosedMessage(req.subId, "error: search backend unavailable"))
                 return
             }
 
             for (event in hits.take(limit)) {
-                conn.send(Protocol.event(req.subscriptionId, event))
+                conn.send(EventMessage(req.subId, event))
             }
         }
-        conn.send(Protocol.eose(req.subscriptionId))
+        conn.send(EoseMessage(req.subId))
     }
 
-    private suspend fun handleAuth(conn: Connection, auth: Protocol.Inbound.Auth) {
+    private suspend fun handleAuth(conn: Connection, auth: AuthCmd) {
         val event = auth.event
         when (val result = Nip42.verify(event, conn.challenge, config.relayUrls)) {
             is Nip42.Result.Rejected -> {
-                conn.send(Protocol.ok(event.id, false, result.reason))
+                conn.send(OkMessage(event.id, false, result.reason))
             }
             is Nip42.Result.Ok -> {
                 // Ownership of the pubkey is proven against this connection's challenge.
@@ -137,12 +148,12 @@ class RelayServer(
                 // life of this connection.
                 val token = backend.login(event)
                 if (token == null) {
-                    conn.send(Protocol.ok(event.id, false, "restricted: backend declined authentication"))
+                    conn.send(OkMessage(event.id, false, "restricted: backend declined authentication"))
                 } else {
                     conn.pubkey = result.pubkey
                     conn.jwt = token
                     conn.jwtExpiresAt = Jwt.parseExpiry(token)
-                    conn.send(Protocol.ok(event.id, true, ""))
+                    conn.send(OkMessage(event.id, true, ""))
                     log.debug("authenticated {}", result.pubkey)
                 }
             }
