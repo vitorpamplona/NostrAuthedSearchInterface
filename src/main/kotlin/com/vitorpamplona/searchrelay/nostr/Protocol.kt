@@ -1,18 +1,15 @@
 package com.vitorpamplona.searchrelay.nostr
 
+import com.vitorpamplona.quartz.nip01Core.core.Event
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
-import kotlinx.serialization.json.addJsonObject
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
-import kotlinx.serialization.json.put
 
 /**
  * Parsing of inbound relay messages and construction of outbound ones, following the
@@ -77,11 +74,9 @@ object Protocol {
     private fun parseAuth(root: JsonArray): Inbound {
         val payload = root.getOrNull(1) as? JsonObject
             ?: return Inbound.Malformed("AUTH must carry a signed event object")
-        return try {
-            Inbound.Auth(json.decodeFromJsonElement<Event>(payload))
-        } catch (e: Exception) {
-            Inbound.Malformed("AUTH event malformed: ${e.message}")
-        }
+        val event = Event.fromJsonOrNull(payload.toString())
+            ?: return Inbound.Malformed("AUTH event malformed")
+        return Inbound.Auth(event)
     }
 
     // ---- Outbound builders ---------------------------------------------------------

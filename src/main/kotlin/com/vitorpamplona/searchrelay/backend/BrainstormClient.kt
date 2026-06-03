@@ -1,8 +1,8 @@
 package com.vitorpamplona.searchrelay.backend
 
+import com.vitorpamplona.quartz.nip01Core.core.Event
+import com.vitorpamplona.quartz.nip01Core.crypto.EventHasher
 import com.vitorpamplona.searchrelay.Config
-import com.vitorpamplona.searchrelay.nostr.Event
-import com.vitorpamplona.searchrelay.nostr.toHexString
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.cio.CIO
 import io.ktor.client.request.get
@@ -27,7 +27,6 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import org.slf4j.LoggerFactory
-import java.security.MessageDigest
 
 /**
  * Thin async client over the Brainstorm search backend. One instance is shared by every
@@ -79,23 +78,22 @@ class BrainstormClient(private val config: Config) : AutoCloseable {
      * `{ data: { token } }`. Returns null if the backend rejects the event.
      */
     suspend fun login(authEvent: Event): String? {
-        val url = config.backendLoginUrl(authEvent.pubkey)
-        val payload = buildJsonObject {
-            put("signed_event", Protocol_eventToJson(authEvent))
-        }
+        val url = config.backendLoginUrl(authEvent.pubKey)
+        // Quartz produces the canonical NIP-01 JSON; wrap it as { "signed_event": <event> }.
+        val payload = """{"signed_event":${authEvent.toJson()}}"""
         return try {
             val response = http.post(url) {
                 contentType(ContentType.Application.Json)
-                setBody(payload.toString())
+                setBody(payload)
             }
             if (!response.status.isSuccess()) {
-                log.warn("backend login rejected pubkey {} with {}", authEvent.pubkey, response.status)
+                log.warn("backend login rejected pubkey {} with {}", authEvent.pubKey, response.status)
                 return null
             }
             val body = json.parseToJsonElement(response.bodyAsText()).jsonObject
             body["data"]?.jsonObject?.get("token")?.jsonPrimitive?.contentOrNull
         } catch (e: Exception) {
-            log.warn("backend login call failed for {}: {}", authEvent.pubkey, e.message)
+            log.warn("backend login call failed for {}: {}", authEvent.pubKey, e.message)
             null
         }
     }
@@ -129,8 +127,9 @@ class BrainstormClient(private val config: Config) : AutoCloseable {
             }
         }
 
-        val tagList = tags.map { tag -> tag.jsonArray.map { it.jsonPrimitive.content } }
-        val id = Event.computeId(pubkey, createdAt, 0, tagList, content)
+        val tagArray = tags.map { tag -> tag.jsonArray.map { it.jsonPrimitive.content }.toTypedArray() }
+            .toTypedArray()
+        val id = EventHasher.hashId(pubkey, createdAt, 0, tagArray, content)
 
         return buildJsonObject {
             put("id", id)
@@ -148,17 +147,4 @@ class BrainstormClient(private val config: Config) : AutoCloseable {
     }
 
     override fun close() = http.close()
-}
-
-/** Serializes an Event back into its canonical JSON object for forwarding to the backend. */
-private fun Protocol_eventToJson(e: Event): JsonObject = buildJsonObject {
-    put("id", e.id)
-    put("pubkey", e.pubkey)
-    put("created_at", e.created_at)
-    put("kind", e.kind)
-    put("tags", buildJsonArray {
-        e.tags.forEach { tag -> add(buildJsonArray { tag.forEach { add(it) } }) }
-    })
-    put("content", e.content)
-    put("sig", e.sig)
 }

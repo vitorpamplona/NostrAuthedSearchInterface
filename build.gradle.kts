@@ -1,6 +1,7 @@
 plugins {
-    kotlin("jvm") version "2.1.0"
-    kotlin("plugin.serialization") version "2.1.0"
+    // Kotlin 2.3.x is required to read Quartz 1.11.0's metadata (compiled with 2.3.0).
+    kotlin("jvm") version "2.3.20"
+    kotlin("plugin.serialization") version "2.3.20"
     application
     id("com.gradleup.shadow") version "8.3.5"
 }
@@ -10,6 +11,7 @@ version = "0.1.0"
 
 repositories {
     mavenCentral()
+    google() // quartz-jvm pulls androidx.sqlite (KMP), published on Google's Maven repo
 }
 
 val ktorVersion = "3.0.3"
@@ -30,11 +32,9 @@ dependencies {
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
 
-    // Schnorr (BIP-340) signature verification over secp256k1 — the same native
-    // library Quartz (Amethyst) uses for Nostr events. The `-kmp` module carries the
-    // Kotlin API; the `-jni-jvm` module carries the native binaries it binds to.
-    implementation("fr.acinq.secp256k1:secp256k1-kmp:0.17.3")
-    implementation("fr.acinq.secp256k1:secp256k1-kmp-jni-jvm:0.17.3")
+    // Nostr toolkit (event model, NIP-01 serialization/verification, NIP-42 auth events) —
+    // Quartz, the same library Amethyst uses. Brings its secp256k1 schnorr backend with it.
+    implementation("com.vitorpamplona.quartz:quartz:1.11.0")
 
     // Logging
     implementation("ch.qos.logback:logback-classic:1.5.12")
