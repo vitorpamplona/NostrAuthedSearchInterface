@@ -11,27 +11,13 @@ import io.ktor.server.routing.routing
 import io.ktor.server.websocket.WebSockets
 import io.ktor.server.websocket.webSocket
 import org.slf4j.LoggerFactory
-import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
 
 private val log = LoggerFactory.getLogger("com.vitorpamplona.searchrelay.Main")
 
 fun main() {
     val config = Config()
     val backend = BrainstormClient(config)
-    val sessions = SessionStore(config.sessionDefaultTtlSeconds)
-    val relay = RelayServer(config, backend, sessions)
-
-    // Periodically evict expired sessions so disconnected users don't accumulate.
-    val sweeper = Executors.newSingleThreadScheduledExecutor { r ->
-        Thread(r, "session-sweeper").apply { isDaemon = true }
-    }
-    sweeper.scheduleWithFixedDelay(
-        { runCatching { sessions.sweepExpired() } },
-        config.sessionSweepIntervalSeconds,
-        config.sessionSweepIntervalSeconds,
-        TimeUnit.SECONDS,
-    )
+    val relay = RelayServer(config, backend)
 
     log.info("Starting Nostr search relay on {}:{} -> backend {}", config.host, config.port, config.backendBaseUrl)
 
@@ -40,19 +26,18 @@ fun main() {
         host = config.host,
         port = config.port,
     ) {
-        module(config, relay, sessions)
+        module(config, relay)
     }
 
     Runtime.getRuntime().addShutdownHook(Thread {
         log.info("Shutting down…")
-        sweeper.shutdownNow()
         backend.close()
     })
 
     server.start(wait = true)
 }
 
-fun Application.module(config: Config, relay: RelayServer, sessions: SessionStore) {
+fun Application.module(config: Config, relay: RelayServer) {
     install(WebSockets) {
         pingPeriodMillis = 30_000
         timeoutMillis = 60_000
@@ -70,10 +55,7 @@ fun Application.module(config: Config, relay: RelayServer, sessions: SessionStor
             call.respondText("ok")
         }
         get("/metrics") {
-            call.respondText(
-                "relay_live_connections ${relay.liveConnectionCount()}\n" +
-                    "relay_active_sessions ${sessions.activeCount()}\n"
-            )
+            call.respondText("relay_live_connections ${relay.liveConnectionCount()}\n")
         }
     }
 }
