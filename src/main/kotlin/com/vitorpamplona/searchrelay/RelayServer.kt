@@ -22,6 +22,7 @@ import java.util.concurrent.atomic.AtomicLong
 class RelayServer(
     private val config: Config,
     private val backend: BrainstormClient,
+    private val sessions: SessionStore,
 ) {
     private val log = LoggerFactory.getLogger(RelayServer::class.java)
     private val liveConnections = AtomicLong(0)
@@ -31,13 +32,17 @@ class RelayServer(
     /** A single WebSocket connection. */
     private inner class Connection(val session: DefaultWebSocketSession) {
         val challenge: String = Nip42.newChallenge()
+
+        // The proven pubkey for this socket. The JWT itself lives in the relay-wide
+        // SessionStore (keyed by pubkey) so it survives reconnects and is shared across
+        // connections; we look it up there at use time so expiry/refresh is always honoured.
         @Volatile var pubkey: String? = null
-        @Volatile var jwt: String? = null
 
         // Serializes writes so concurrent coroutines never interleave frames.
         private val sendLock = Mutex()
 
-        val authenticated: Boolean get() = jwt != null
+        /** The current valid session for this socket's pubkey, or null if none/expired. */
+        fun session(): Session? = pubkey?.let { sessions.get(it) }
 
         suspend fun send(text: String) = sendLock.withLock { session.send(text) }
     }
@@ -79,6 +84,14 @@ class RelayServer(
     }
 
     private suspend fun handleReq(conn: Connection, req: Protocol.Inbound.Req) {
+        // Resolve the session once per REQ from the relay-wide store. If the pubkey was
+        // authenticated earlier but its JWT has since expired, notify and fall back to anon.
+        val session = conn.session()
+        if (session == null && conn.pubkey != null) {
+            conn.pubkey = null
+            conn.send(Protocol.notice("auth-required: session expired, please AUTH again"))
+        }
+
         // NIP-50: we only serve filters that carry a `search` term. Other filters EOSE empty.
         for (filter in req.filters) {
             val term = filter.search?.trim()
@@ -88,8 +101,8 @@ class RelayServer(
             val hits = try {
                 backend.searchProfiles(
                     text = term,
-                    ownPubkey = conn.authenticated,
-                    jwt = conn.jwt,
+                    ownPubkey = session != null,
+                    jwt = session?.jwt,
                 )
             } catch (e: Exception) {
                 log.warn("search failed for '{}': {}", term, e.message)
@@ -111,14 +124,23 @@ class RelayServer(
                 conn.send(Protocol.ok(event.id, false, result.reason))
             }
             is Nip42.Result.Ok -> {
-                // Ownership of the pubkey is proven locally. Exchange the event for a backend
-                // JWT (validated NIP-98-style). On success, future searches use ownPubkey=true.
+                // Ownership of the pubkey is proven locally. If the relay already holds a
+                // valid session for this pubkey (e.g. a reconnect), resume it without calling
+                // the backend; otherwise exchange the event for a fresh JWT and store it.
+                val existing = sessions.get(result.pubkey)
+                if (existing != null) {
+                    conn.pubkey = result.pubkey
+                    conn.send(Protocol.ok(event.id, true, ""))
+                    log.debug("resumed session for {}", result.pubkey)
+                    return
+                }
+
                 val token = backend.login(event)
                 if (token == null) {
                     conn.send(Protocol.ok(event.id, false, "restricted: backend declined authentication"))
                 } else {
+                    sessions.put(result.pubkey, token)
                     conn.pubkey = result.pubkey
-                    conn.jwt = token
                     conn.send(Protocol.ok(event.id, true, ""))
                     log.debug("authenticated {}", result.pubkey)
                 }

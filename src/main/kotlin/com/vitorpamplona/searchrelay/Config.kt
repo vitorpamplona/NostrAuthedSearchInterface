@@ -41,6 +41,12 @@ data class Config(
 
     /** Maximum number of search hits returned per filter, regardless of client `limit`. */
     val maxResults: Int = env("MAX_RESULTS", "100").toInt(),
+
+    /** Fallback session lifetime when a JWT carries no parseable expiry. */
+    val sessionDefaultTtlSeconds: Long = env("SESSION_DEFAULT_TTL_SECONDS", "3600").toLong(),
+
+    /** How often the relay evicts expired sessions from its store. */
+    val sessionSweepIntervalSeconds: Long = env("SESSION_SWEEP_INTERVAL_SECONDS", "300").toLong(),
 ) {
     /** Backend endpoint that validates the NIP-42 event and returns a JWT. */
     fun backendLoginUrl(pubkey: String): String = "$backendBaseUrl/authChallenge/$pubkey/verify"

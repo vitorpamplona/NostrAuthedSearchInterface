@@ -36,7 +36,22 @@ Everything else (`EVENT` publishing, other filters, subscriptions) is intentiona
    - Authenticated → `ownPubkey=true`, JWT sent in the `access_token` header.
 3. To authenticate, the client replies with `["AUTH", <signed kind-22242 event>]` carrying
    the `challenge` (and optionally `relay`) tags. The relay verifies the BIP-340 signature
-   locally, then exchanges the event for a JWT and holds it for the life of the connection.
+   locally, then exchanges the event for a JWT and stores the session (see below).
+
+### Relay-stored sessions
+
+The JWT is **not** tied to a single socket. The relay keeps a server-side session store keyed
+by pubkey (`pubkey → JWT + expiry`), so:
+
+- A client that drops and **reconnects — or opens a second connection — resumes its session
+  without the relay calling the backend again**, as long as the JWT is still valid. The
+  pubkey is still re-proven via NIP-42 on every connection, so a cached session can never be
+  hijacked by someone else.
+- Expiry is read from the JWT (standard `exp`, or the backend's `expires_date`), and a
+  background sweeper evicts expired sessions. If a session expires mid-connection, the next
+  search falls back to anonymous and the client is told to re-`AUTH`.
+
+`GET /metrics` exposes both `relay_live_connections` and `relay_active_sessions`.
 
 > **Synthesized events are unsigned.** The search index stores indexed profile fields, not
 > the original signed `kind:0` events, so the events we emit have `sig: ""` and extra
@@ -74,6 +89,8 @@ All via environment variables (defaults target staging and work out of the box):
 | `WS_MAX_FRAME_BYTES` | `131072` | Max inbound frame size |
 | `BACKEND_MAX_CONNECTIONS` / `_PER_ROUTE` | `2000` / `1000` | Backend HTTP pool sizing |
 | `BACKEND_REQUEST_TIMEOUT_MS` | `15000` | Backend call timeout |
+| `SESSION_DEFAULT_TTL_SECONDS` | `3600` | Session lifetime when a JWT has no parseable expiry |
+| `SESSION_SWEEP_INTERVAL_SECONDS` | `300` | How often expired sessions are evicted |
 
 ## Build, test, run
 
