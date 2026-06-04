@@ -107,9 +107,11 @@ docker run -p 8080:8080 -e VESPA_URL=http://vespa:8081 -e RELAY_URL=wss://your.r
   - an `EventSource` (`SearchSource`) whose `events(ctx, filters)` parses the filter with
     `SearchQuery` (NIP-50) and queries Vespa. It reads the observer pubkey from
     `ctx.authenticatedUsers` (the NIP-42 pubkey) or falls back to the default observer; and
-  - a `FullAuthPolicy` subclass (`SearchAuthPolicy`) — Quartz does the entire NIP-42 handshake
-    and tracks the authenticated pubkey; we only override `accept(ReqCmd)` to allow anonymous
-    search. There is nothing else to add, because the observer needs no token.
+  - a `FullAuthPolicy` subclass (`SearchAuthPolicy`) — Quartz does the NIP-42 handshake and
+    tracks the authenticated pubkey; we override `accept(ReqCmd)` to allow anonymous search.
+    It is composed as **`VerifyAuthOnlyPolicy + SearchAuthPolicy`**: `FullAuthPolicy` checks the
+    challenge/relay/freshness but **not the signature**, so the verify policy must be stacked in
+    to reject a forged AUTH before its pubkey can become the observer (see `AuthSignatureTest`).
   So the whole Ktor handler is `server.serve(send) { s -> for (f in incoming) s.receive(f.text) }`.
 - **Vespa query** (`VespaQuery` / `VespaClient`) is a faithful port of the brainstorm server's
   `app/core/vespa.py` — same YQL, rank profile and `user_q` observer feature — verified
@@ -125,6 +127,10 @@ docker run -p 8080:8080 -e VESPA_URL=http://vespa:8081 -e RELAY_URL=wss://your.r
 The headline gap — **`EventSource` had no per-connection/auth context** — is now **fixed**
 upstream: `events(ctx, filters)` receives a `RequestContext` exposing the connection's
 `policy`/`authenticatedUsers`, so the per-connection auth holder and the manual `RelaySession`
-wiring are gone, and this uses the plain `EventSourceServer.serve()` path. Minor remaining
-nits: `FullAuthPolicy` gates `REQ` (we override `accept(ReqCmd)` to allow anonymous search), and
-`NegentropySettings` is required even though this relay stores nothing.
+wiring are gone, and this uses the plain `EventSourceServer.serve()` path.
+
+Remaining nits: `FullAuthPolicy` gates `REQ` (we override `accept(ReqCmd)` to allow anonymous
+search); `NegentropySettings` is required even though this relay stores nothing; and — the sharp
+one — **`FullAuthPolicy` does not verify the AUTH signature on its own**. You must compose it with
+`VerifyAuthOnlyPolicy` (`+`), or any client can claim any pubkey. That's easy to miss; a verifying
+`FullAuthPolicy` by default (or a loud warning) would be safer.

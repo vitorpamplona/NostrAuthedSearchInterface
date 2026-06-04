@@ -4,6 +4,7 @@ import com.vitorpamplona.quartz.nip01Core.relay.normalizer.RelayUrlNormalizer
 import com.vitorpamplona.quartz.nip01Core.relay.server.EventSourceServer
 import com.vitorpamplona.quartz.nip01Core.relay.server.RelayServerListener
 import com.vitorpamplona.quartz.nip01Core.relay.server.policies.RelayLimits
+import com.vitorpamplona.quartz.nip01Core.relay.server.policies.VerifyAuthOnlyPolicy
 import com.vitorpamplona.quartz.nip77Negentropy.NegentropySettings
 import com.vitorpamplona.searchrelay.backend.VespaClient
 import io.ktor.websocket.DefaultWebSocketSession
@@ -27,7 +28,9 @@ class RelayServer(
 
     private val server = EventSourceServer(
         SearchSource(vespa, config.defaultObserver, config.onlyRanked, config.maxResults),
-        { SearchAuthPolicy(relayUrl) }, // a fresh policy per connection
+        // Verify the AUTH signature, THEN do the NIP-42 challenge/relay/freshness checks.
+        // FullAuthPolicy alone doesn't verify signatures, so the verify policy must be stacked.
+        { VerifyAuthOnlyPolicy + SearchAuthPolicy(relayUrl) },
         Dispatchers.Default,
         NO_STORAGE_NEGENTROPY,
         object : RelayServerListener {},
