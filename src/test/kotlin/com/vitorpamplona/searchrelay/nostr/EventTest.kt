@@ -59,20 +59,4 @@ class EventTest {
         val tamperedPubkey = Event(e2.id, "deadbeef" + e2.pubKey.substring(8), e2.createdAt, e2.kind, e2.tags, e2.content, e2.sig)
         assertFalse(tamperedPubkey.verify())
     }
-
-    @Test
-    fun `nip42 accepts the matching challenge and relay`() {
-        val result = Nip42.verify(e2, "deadbeef", setOf("wss://relay.example.com"), now = 1735700010)
-        assertEquals(Nip42.Result.Ok(e2.pubKey), result)
-    }
-
-    @Test
-    fun `nip42 rejects a mismatched challenge`() {
-        assertTrue(Nip42.verify(e2, "other", emptySet(), now = 1735700010) is Nip42.Result.Rejected)
-    }
-
-    @Test
-    fun `nip42 rejects a stale event`() {
-        assertTrue(Nip42.verify(e2, "deadbeef", emptySet(), now = 1735700000 + 10_000) is Nip42.Result.Rejected)
-    }
 }

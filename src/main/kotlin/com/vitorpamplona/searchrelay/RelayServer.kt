@@ -1,39 +1,39 @@
 package com.vitorpamplona.searchrelay
 
-import com.vitorpamplona.quartz.nip01Core.core.OptimizedSerializable
-import com.vitorpamplona.quartz.nip01Core.jackson.JacksonMapper
-import com.vitorpamplona.quartz.nip01Core.relay.commands.toClient.AuthMessage
-import com.vitorpamplona.quartz.nip01Core.relay.commands.toClient.ClosedMessage
-import com.vitorpamplona.quartz.nip01Core.relay.commands.toClient.EoseMessage
-import com.vitorpamplona.quartz.nip01Core.relay.commands.toClient.EventMessage
-import com.vitorpamplona.quartz.nip01Core.relay.commands.toClient.NoticeMessage
-import com.vitorpamplona.quartz.nip01Core.relay.commands.toClient.OkMessage
-import com.vitorpamplona.quartz.nip01Core.relay.commands.toRelay.AuthCmd
-import com.vitorpamplona.quartz.nip01Core.relay.commands.toRelay.CloseCmd
+import com.vitorpamplona.quartz.nip01Core.core.Event
+import com.vitorpamplona.quartz.nip01Core.relay.filters.Filter
 import com.vitorpamplona.quartz.nip01Core.relay.commands.toRelay.ReqCmd
+import com.vitorpamplona.quartz.nip01Core.relay.normalizer.RelayUrlNormalizer
+import com.vitorpamplona.quartz.nip01Core.relay.server.RelaySession
+import com.vitorpamplona.quartz.nip01Core.relay.server.backend.EventSource
+import com.vitorpamplona.quartz.nip01Core.relay.server.backend.EventSourceBackend
+import com.vitorpamplona.quartz.nip01Core.relay.server.policies.FullAuthPolicy
+import com.vitorpamplona.quartz.nip01Core.relay.server.policies.PolicyResult
+import com.vitorpamplona.quartz.nip42RelayAuth.RelayAuthEvent
+import com.vitorpamplona.quartz.nip50Search.SearchQuery
+import com.vitorpamplona.quartz.nip77Negentropy.NegentropySettings
 import com.vitorpamplona.searchrelay.backend.BrainstormClient
-import com.vitorpamplona.searchrelay.nostr.Nip42
 import io.ktor.websocket.DefaultWebSocketSession
 import io.ktor.websocket.Frame
 import io.ktor.websocket.readText
-import io.ktor.websocket.send
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
 import org.slf4j.LoggerFactory
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Per-connection authentication state and the message routing logic.
+ * Wires Quartz's relay-server engine to Ktor. Each WebSocket gets its own [RelaySession],
+ * which drives the whole protocol (NIP-42 challenge on connect, REQ → EVENT… → EOSE, OK/CLOSED).
+ * We supply only two things:
  *
- * The relay is a stateless search redirector: a REQ with a NIP-50 `search` field is turned
- * into a backend HTTP call and the hits are streamed back as EVENT + EOSE. There are no
- * long-lived subscriptions to track, which keeps each idle connection cheap.
+ *  - a [SearchSource] (Quartz's [EventSource] SPI) that turns a NIP-50 search filter into a
+ *    backend HTTP call and streams the hits back as events, and
+ *  - a [BrainstormAuthPolicy] (a [FullAuthPolicy] subclass) whose suspend `authorize` hook
+ *    exchanges the verified NIP-42 event for a per-connection JWT.
  *
- * Wire parsing/serialization uses Quartz's relay command model (`Command` / `Message` via
- * `JacksonMapper`); NIP-42 authentication is bound to the connection: every socket is greeted
- * with its own fresh challenge and must AUTH against it. The backend JWT is held by the relay
- * only for the life of that connection — a reconnect gets a new challenge and must AUTH again.
+ * The two share a per-connection [ConnectionAuth] holder, because Quartz's `EventSource` is not
+ * handed any session/auth context — see README "Quartz friction".
  */
 class RelayServer(
     private val config: Config,
@@ -41,46 +41,28 @@ class RelayServer(
 ) {
     private val log = LoggerFactory.getLogger(RelayServer::class.java)
     private val liveConnections = AtomicLong(0)
+    private val connectionIds = AtomicLong(0)
+    private val relayUrl = RelayUrlNormalizer.normalize(config.relayUrl)
 
     fun liveConnectionCount(): Long = liveConnections.get()
 
-    /** A single WebSocket connection and its (per-connection) authenticated session. */
-    private inner class Connection(val session: DefaultWebSocketSession) {
-        val challenge: String = Nip42.newChallenge()
-
-        // The pubkey proven on this socket and the JWT minted for it, held by the relay for
-        // this connection only. Cleared when the JWT expires; gone entirely on disconnect.
-        @Volatile var pubkey: String? = null
-        @Volatile var jwt: String? = null
-        @Volatile var jwtExpiresAt: Instant? = null
-
-        // Serializes writes so concurrent coroutines never interleave frames.
-        private val sendLock = Mutex()
-
-        /** True while this connection holds a still-valid JWT. */
-        fun authenticated(now: Instant = Instant.now()): Boolean =
-            jwt != null && (jwtExpiresAt?.isAfter(now) ?: true)
-
-        suspend fun send(message: OptimizedSerializable) =
-            sendLock.withLock { session.send(JacksonMapper.toJson(message)) }
-    }
-
-    suspend fun handle(session: DefaultWebSocketSession) {
-        val conn = Connection(session)
+    suspend fun handle(ws: DefaultWebSocketSession) {
+        val auth = ConnectionAuth()
+        val session = RelaySession(
+            EventSourceBackend(SearchSource(backend, auth, config.maxResults)),
+            BrainstormAuthPolicy(relayUrl, backend, auth),
+            ws, // the WebSocket session is the CoroutineScope the engine runs in
+            { text -> ws.outgoing.trySend(Frame.Text(text)) }, // non-suspend sink the engine writes to
+            { },
+            NegentropySettings(50_000L, 10_000, 1),
+            connectionIds.incrementAndGet(),
+        )
         liveConnections.incrementAndGet()
         try {
-            // NIP-42: greet the client with an auth challenge straight away. Clients that
-            // don't care about authenticated results may simply ignore it.
-            conn.send(AuthMessage(conn.challenge))
-
-            for (frame in session.incoming) {
-                if (frame !is Frame.Text) continue
-                val text = frame.readText()
-                if (text.length.toLong() > config.maxFrameSize) {
-                    conn.send(NoticeMessage("error: message too large"))
-                    continue
+            session.use { live ->
+                for (frame in ws.incoming) {
+                    if (frame is Frame.Text) live.receive(frame.readText())
                 }
-                route(conn, text)
             }
         } catch (e: Exception) {
             log.debug("connection closed: {}", e.message)
@@ -89,73 +71,57 @@ class RelayServer(
         }
     }
 
-    private suspend fun route(conn: Connection, text: String) {
-        val command = try {
-            JacksonMapper.fromJsonToCommand(text)
-        } catch (e: Exception) {
-            conn.send(NoticeMessage("invalid: could not parse message"))
-            return
-        }
-        when (command) {
-            is ReqCmd -> handleReq(conn, command)
-            is AuthCmd -> handleAuth(conn, command)
-            is CloseCmd -> { /* one-shot search: no long-lived subscription to cancel */ }
-            else -> conn.send(NoticeMessage("unsupported: ${command.label()} is not served by this relay"))
+    /** Per-connection authentication state, populated by the auth policy and read by the source. */
+    class ConnectionAuth {
+        @Volatile var jwt: String? = null
+        @Volatile var expiresAt: Instant? = null
+
+        /** The still-valid JWT for this connection, or null. */
+        fun token(now: Instant = Instant.now()): String? =
+            jwt?.takeIf { expiresAt?.isAfter(now) ?: true }
+    }
+
+    /**
+     * Quartz [EventSource]: answers a REQ by redirecting its NIP-50 `search` filter to the
+     * backend. Authenticated connections (a live JWT) search with ownPubkey=true. The engine
+     * sends EVENT for each emitted event and EOSE when the flow completes.
+     */
+    private class SearchSource(
+        private val backend: BrainstormClient,
+        private val auth: RelayServer.ConnectionAuth,
+        private val maxResults: Int,
+    ) : EventSource {
+        override fun events(filters: List<Filter>): Flow<Event> = flow {
+            for (filter in filters) {
+                val query = filter.search?.let { SearchQuery.parse(it) } ?: continue
+                if (query.isTermsEmpty()) continue
+                val token = auth.token()
+                val limit = filter.limit?.coerceIn(1, maxResults) ?: maxResults
+                backend.searchProfiles(query.terms, ownPubkey = token != null, jwt = token)
+                    .take(limit)
+                    .forEach { emit(it) }
+            }
         }
     }
 
-    private suspend fun handleReq(conn: Connection, req: ReqCmd) {
-        // If the JWT minted earlier on this connection has since expired, drop it and tell the
-        // client to AUTH again; the search then proceeds anonymously.
-        if (conn.pubkey != null && !conn.authenticated()) {
-            conn.pubkey = null
-            conn.jwt = null
-            conn.jwtExpiresAt = null
-            conn.send(NoticeMessage("auth-required: session expired, please AUTH again"))
-        }
-        val authed = conn.authenticated()
+    /**
+     * Quartz [FullAuthPolicy] handles the NIP-42 handshake (challenge on connect, signature +
+     * challenge + relay-tag verification). We only add the app-specific step: exchange the
+     * verified event for a backend JWT and stash it on the connection for authenticated search.
+     */
+    private class BrainstormAuthPolicy(
+        relay: com.vitorpamplona.quartz.nip01Core.relay.normalizer.NormalizedRelayUrl,
+        private val backend: BrainstormClient,
+        private val auth: RelayServer.ConnectionAuth,
+    ) : FullAuthPolicy(relay) {
+        // FullAuthPolicy gates REQ behind authentication; we instead allow anonymous search
+        // (ownPubkey=false) and treat auth as optional, so REQ is always accepted.
+        override fun accept(command: ReqCmd): PolicyResult<ReqCmd> = PolicyResult.Accepted(command)
 
-        // NIP-50: we only serve filters that carry a `search` term. Other filters EOSE empty.
-        for (filter in req.filters) {
-            val term = filter.search?.trim()
-            if (term.isNullOrEmpty()) continue
-            val limit = filter.limit?.coerceIn(1, config.maxResults) ?: config.maxResults
-
-            val hits = try {
-                backend.searchProfiles(text = term, ownPubkey = authed, jwt = conn.jwt)
-            } catch (e: Exception) {
-                log.warn("search failed for '{}': {}", term, e.message)
-                conn.send(ClosedMessage(req.subId, "error: search backend unavailable"))
-                return
-            }
-
-            for (event in hits.take(limit)) {
-                conn.send(EventMessage(req.subId, event))
-            }
-        }
-        conn.send(EoseMessage(req.subId))
-    }
-
-    private suspend fun handleAuth(conn: Connection, auth: AuthCmd) {
-        val event = auth.event
-        when (val result = Nip42.verify(event, conn.challenge, config.relayUrls)) {
-            is Nip42.Result.Rejected -> {
-                conn.send(OkMessage(event.id, false, result.reason))
-            }
-            is Nip42.Result.Ok -> {
-                // Ownership of the pubkey is proven against this connection's challenge.
-                // Exchange the event for a JWT (validated NIP-98-style) and hold it for the
-                // life of this connection.
-                val token = backend.login(event)
-                if (token == null) {
-                    conn.send(OkMessage(event.id, false, "restricted: backend declined authentication"))
-                } else {
-                    conn.pubkey = result.pubkey
-                    conn.jwt = token
-                    conn.jwtExpiresAt = Jwt.parseExpiry(token)
-                    conn.send(OkMessage(event.id, true, ""))
-                    log.debug("authenticated {}", result.pubkey)
-                }
+        override suspend fun authorize(pubkey: String, event: RelayAuthEvent) {
+            backend.login(event)?.let { token ->
+                auth.jwt = token
+                auth.expiresAt = Jwt.parseExpiry(token)
             }
         }
     }

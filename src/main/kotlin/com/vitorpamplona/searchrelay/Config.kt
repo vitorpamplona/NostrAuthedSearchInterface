@@ -1,7 +1,5 @@
 package com.vitorpamplona.searchrelay
 
-import com.vitorpamplona.searchrelay.nostr.Nip42
-
 /**
  * Runtime configuration, sourced from environment variables with sensible defaults so the
  * relay runs out of the box against the staging backend.
@@ -26,15 +24,10 @@ data class Config(
     val backendMaxConnectionsPerRoute: Int = env("BACKEND_MAX_CONNECTIONS_PER_ROUTE", "1000").toInt(),
 
     /**
-     * Relay URL(s) accepted in the NIP-42 `relay` tag, comma-separated. Empty disables the
-     * check (useful behind a proxy where the externally visible URL is hard to know).
+     * This relay's public URL, enforced as the NIP-42 `relay` tag by Quartz's FullAuthPolicy.
+     * Clients must sign their AUTH event against this URL.
      */
-    val relayUrls: Set<String> = env("RELAY_PUBLIC_URLS", "")
-        .split(',')
-        .map { it.trim() }
-        .filter { it.isNotEmpty() }
-        .map { Nip42.normalizeRelayUrl(it) }
-        .toSet(),
+    val relayUrl: String = env("RELAY_URL", "wss://nostr-search.relay/"),
 
     /** Max inbound WebSocket frame size in bytes. */
     val maxFrameSize: Long = env("WS_MAX_FRAME_BYTES", "131072").toLong(),

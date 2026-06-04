@@ -113,17 +113,38 @@ docker run -p 8080:8080 -e BACKEND_BASE_URL=... nostr-search-redirector
 - **Stack:** Kotlin + Ktor (Netty engine). Connections are coroutine-driven and each search
   is a one-shot non-blocking backend call — there are no long-lived subscriptions to track,
   so idle connections are cheap and the service holds many thousands of sockets.
-- **Nostr:** the entire protocol layer is **Quartz** (`com.vitorpamplona.quartz:quartz`), the
-  toolkit Amethyst uses — we don't hand-roll any of it:
-  - Wire messages: `JacksonMapper.fromJsonToCommand` parses client `REQ`/`AUTH`/`CLOSE` into
-    Quartz's `Command` model (`ReqCmd`/`AuthCmd`/`CloseCmd`, with `Filter.search` for NIP-50);
-    replies are Quartz `Message` objects (`EventMessage`/`EoseMessage`/`OkMessage`/
-    `ClosedMessage`/`NoticeMessage`/`AuthMessage`) serialized via `JacksonMapper.toJson`.
-  - Events: `EventHasher` for NIP-01 id hashing, `event.verify()` for BIP-340 schnorr, and the
-    `RelayAuthEvent` (kind 22242) model for NIP-42.
-  - Quartz is pulled from **amethyst `main` via JitPack** (`com.github.vitorpamplona.amethyst:quartz`,
-    pinned to a commit) to get the latest relay-server tooling. It's a Kotlin Multiplatform
-    library whose JVM variant transitively needs `androidx.sqlite`, so the build adds Google's
-    Maven repo (`google()`) and the JitPack repo, and requires Kotlin 2.3.x (Quartz's metadata
-    is compiled with 2.3.0).
+- **Nostr:** the entire protocol layer is **Quartz**'s relay-server engine — we don't hand-roll
+  any of it. Each WebSocket creates a Quartz `RelaySession` that drives the whole protocol
+  (NIP-42 challenge on connect, `REQ` → `EVENT…` → `EOSE`, `OK`/`CLOSED`, message/sub limits).
+  The app supplies just two small pieces (see `RelayServer.kt`):
+  - an `EventSource` (`SearchSource`) whose `events(filters)` parses the filter with
+    `SearchQuery` (NIP-50), redirects to the backend, and emits the hits as `Event`s; and
+  - a `FullAuthPolicy` subclass (`BrainstormAuthPolicy`) — Quartz does the NIP-42 challenge +
+    signature/challenge/relay verification; we override the suspend `authorize` hook to swap the
+    verified event for a JWT, and `accept(ReqCmd)` to allow anonymous search.
+  So the Ktor handler is essentially `for (frame in incoming) session.receive(frame.text)`.
+- Quartz is pulled from **amethyst `main` via JitPack** (`com.github.vitorpamplona.amethyst:quartz`,
+  pinned to a commit). It's a Kotlin Multiplatform library whose JVM variant transitively needs
+  `androidx.sqlite`, so the build adds Google's Maven repo (`google()`) and the JitPack repo, and
+  requires Kotlin 2.3.x (Quartz's metadata is compiled with 2.3.0).
 - A shared Ktor CIO HTTP client pools connections to the backend across all sockets.
+
+### Quartz friction (things that would make a relay like this leaner still)
+
+The new engine removed most of the code, but a few rough edges remain for an auth-scoped
+redirector:
+
+1. **`EventSource.events(filters)` gets no per-connection/auth context.** A redirector needs the
+   connection's authenticated identity/JWT to set `ownPubkey`, but `EventSource` is a single
+   shared object. So instead of the one-liner `EventSourceServer.serve()`, we construct a
+   `RelaySession` per socket with a per-connection `EventSource` + policy sharing a
+   `ConnectionAuth` holder. Passing the session (or its policy/auth set) into `events()` would
+   let the simple shared-server path work.
+2. **`FullAuthPolicy` requires auth for `REQ`.** For "anonymous allowed, auth optional" relays we
+   had to override `accept(ReqCmd)`. A challenge-issuing-but-non-gating policy variant would fit
+   search/redirector use cases out of the box.
+3. **NIP-77 plumbing is mandatory.** `RelaySession` requires `NegentropySettings` even though a
+   redirector stores nothing; an opt-out default would simplify.
+4. **`RelaySession` wiring is manual** (CoroutineScope + id + `send`/`onClose`), and the `send`
+   sink is a non-suspend `(String) -> Unit` (forcing `trySend`, with backpressure risk). A small
+   transport adapter and/or a suspend send hook would remove the boilerplate.
