@@ -1,27 +1,30 @@
 package com.vitorpamplona.searchrelay
 
 /**
- * Runtime configuration, sourced from environment variables with sensible defaults so the
- * relay runs out of the box against the staging backend.
+ * Runtime configuration, sourced from environment variables with sensible defaults.
  */
 data class Config(
     val host: String = env("RELAY_HOST", "0.0.0.0"),
     val port: Int = env("RELAY_PORT", "8080").toInt(),
 
-    val backendBaseUrl: String = env(
-        "BACKEND_BASE_URL",
-        "https://brainstormserver-staging.nosfabrica.com",
-    ).trimEnd('/'),
+    /** Base URL of the Vespa container the relay queries directly (e.g. http://vespa:8080). */
+    val vespaUrl: String = env("VESPA_URL", "http://localhost:8081").trimEnd('/'),
 
-    /** Header carrying the JWT on backend search calls (the backend uses `access_token`). */
-    val backendTokenHeader: String = env("BACKEND_TOKEN_HEADER", "access_token"),
+    /**
+     * Observer pubkey (hex) used to rank results for anonymous connections. Defaults to the
+     * brainstorm server's hardcoded periodic-graperank perspective.
+     */
+    val defaultObserver: String = env(
+        "DEFAULT_OBSERVER_PUBKEY",
+        "be7bf5de068c1d842ed34a7c270507ec940f5ea51671cfd062a95e9d09420d0a",
+    ),
 
-    /** Pass-through of the backend's onlyRanked search flag. */
-    val onlyRanked: Boolean = env("BACKEND_ONLY_RANKED", "true").toBoolean(),
+    /** If true, drop results with a zero quality_score from the observer's perspective. */
+    val onlyRanked: Boolean = env("ONLY_RANKED", "true").toBoolean(),
 
-    val backendRequestTimeoutMs: Long = env("BACKEND_REQUEST_TIMEOUT_MS", "15000").toLong(),
-    val backendMaxConnectionsCount: Int = env("BACKEND_MAX_CONNECTIONS", "2000").toInt(),
-    val backendMaxConnectionsPerRoute: Int = env("BACKEND_MAX_CONNECTIONS_PER_ROUTE", "1000").toInt(),
+    val requestTimeoutMs: Long = env("VESPA_REQUEST_TIMEOUT_MS", "15000").toLong(),
+    val maxConnectionsCount: Int = env("VESPA_MAX_CONNECTIONS", "2000").toInt(),
+    val maxConnectionsPerRoute: Int = env("VESPA_MAX_CONNECTIONS_PER_ROUTE", "1000").toInt(),
 
     /**
      * This relay's public URL, enforced as the NIP-42 `relay` tag by Quartz's FullAuthPolicy.
@@ -35,9 +38,6 @@ data class Config(
     /** Maximum number of search hits returned per filter, regardless of client `limit`. */
     val maxResults: Int = env("MAX_RESULTS", "100").toInt(),
 ) {
-    /** Backend endpoint that validates the NIP-42 event and returns a JWT. */
-    fun backendLoginUrl(pubkey: String): String = "$backendBaseUrl/authChallenge/$pubkey/verify"
-
     companion object {
         private fun env(name: String, default: String): String =
             System.getenv(name)?.takeIf { it.isNotBlank() } ?: default

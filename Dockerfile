@@ -15,7 +15,7 @@ COPY --from=build /app/build/install/nostr-authed-search-interface ./
 
 ENV RELAY_HOST=0.0.0.0 \
     RELAY_PORT=8080 \
-    BACKEND_BASE_URL=https://brainstormserver-staging.nosfabrica.com
+    VESPA_URL=http://vespa:8081
 
 EXPOSE 8080
 

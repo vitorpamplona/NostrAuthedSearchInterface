@@ -1,76 +1,60 @@
 # Nostr Authed Search Interface
 
-A tiny, high-throughput WebSocket **search redirector** that speaks just enough of the
-Nostr relay protocol to front the [Brainstorm](https://brainstormserver-staging.nosfabrica.com/docs)
-profile-search HTTP API.
+A tiny, high-throughput WebSocket **search relay** that speaks just enough of the Nostr
+protocol to query a [Brainstorm](https://github.com/NosFabrica/brainstorm_server) **Vespa**
+index for profiles — ranked from the caller's own trust perspective.
 
 It is **not a general relay** — it does not store or relay events. It implements only:
 
 - **[NIP-50](https://github.com/nostr-protocol/nips/blob/master/50.md)** — the `search`
-  filter field on `REQ`. Each search is redirected to the backend's
-  `GET /search/byText` endpoint and the hits are streamed back as `EVENT` + `EOSE`.
+  filter field on `REQ`. Each search becomes a Vespa query and the hits stream back as
+  `EVENT` + `EOSE`.
 - **[NIP-42](https://github.com/nostr-protocol/nips/blob/master/42.md)** — client
-  authentication. A connection that authenticates gets a backend JWT, and its subsequent
-  searches are run with `ownPubkey=true` (trust scores from the caller's own perspective).
+  authentication. The authenticated pubkey is used as the **observer perspective** for Vespa's
+  trust scores. **No JWT, no token exchange** — the NIP-42-verified pubkey *is* the credential.
 
 Everything else (`EVENT` publishing, other filters, subscriptions) is intentionally absent.
 
 ## Behaviour
 
 ```
-                        ┌─────────────────────────────────────────────┐
-   Nostr client  ──ws──►│  redirector (this service, Kotlin/Ktor)      │
-                        │                                              │
-   ["REQ",id,{search}]  │   anonymous  ─► GET /search/byText?...&ownPubkey=false
-                        │   authed     ─► GET /search/byText?...&ownPubkey=true
-                        │                       (access_token: <JWT>)  │
-                        │                                              │──http──► Brainstorm API
-   ["AUTH",<22242 evt>] │   verify schnorr locally ─► exchange for JWT │
-                        └─────────────────────────────────────────────┘
+                        ┌──────────────────────────────────────────────┐
+   Nostr client  ──ws──►│  search relay (this service, Kotlin/Ktor)     │
+                        │                                               │
+   ["REQ",id,{search}]  │  anonymous ─► query(user_q)={<defaultObs>:1.0}
+                        │  authed    ─► query(user_q)={<auth'd pubkey>:1.0}
+                        │                                               │──http──► Vespa /search/
+   ["AUTH",<22242 evt>] │  Quartz verifies NIP-42 → pubkey is observer  │
+                        └──────────────────────────────────────────────┘
 ```
 
 1. On connect the relay sends `["AUTH", <challenge>]` (NIP-42).
-2. A `["REQ", subId, { "search": "..." }]` is redirected to `GET /search/byText`. Hits come
-   back as synthesized **kind-0** metadata events, followed by `["EOSE", subId]`.
-   - Not authenticated → `ownPubkey=false`.
-   - Authenticated → `ownPubkey=true`, JWT sent in the `access_token` header.
-3. To authenticate, the client replies with `["AUTH", <signed kind-22242 event>]` carrying
-   the `challenge` (and optionally `relay`) tags. The relay verifies the BIP-340 signature
-   locally, then exchanges the event for a JWT and holds it for the connection (see below).
+2. A `["REQ", subId, { "search": "..." }]` becomes a Vespa `/search/` query (rank profile
+   `name_and_quality_score_only`). Hits come back as synthesized **kind-0** metadata events,
+   followed by `["EOSE", subId]`.
+3. The **observer** — Vespa's `ranking.features.query(user_q) = {<pubkey>:1.0}`, which selects
+   that observer's cell in each doc's `quality_scores` tensor — is:
+   - the **default observer** for anonymous connections, or
+   - the connection's **NIP-42-authenticated pubkey** once it has AUTH'd.
+4. To authenticate, the client replies with `["AUTH", <signed kind-22242 event>]` carrying the
+   `challenge` and `relay` tags. Quartz verifies the BIP-340 signature, challenge and relay tag.
 
-### Per-connection sessions
+### Why there's no JWT
 
-NIP-42 authentication is bound to the connection. Each socket is greeted with its **own**
-fresh challenge, and the AUTH event must be signed against *that* challenge — so:
+The observer pubkey is **not an auth credential** to Vespa — it's just a ranking feature.
+NIP-42 already proves the client controls the pubkey, so the relay passes that hex pubkey
+straight into the Vespa query as `user_q`. This replicates `app/core/vespa.py::search` from the
+brainstorm server (which derived the same observer from a JWT); we skip the
+`/authChallenge` → `/verify` → JWT dance entirely. A query that *is itself* a hex pubkey is
+resolved to a direct `/document/v1` lookup, mirroring `/search/byText`.
 
-- The relay holds the JWT server-side **only for the life of the connection**. On disconnect
-  it is dropped; a **reconnect gets a new challenge and must AUTH again**. (Resuming auth by
-  pubkey across connections would bypass the per-connection challenge, so we deliberately
-  don't.)
-- The relay tracks the JWT's expiry (standard `exp`, or the backend's `expires_date`). If the
-  token expires while the connection is still open, the next search falls back to anonymous
-  and the client is told to re-`AUTH`.
+NIP-42 is per-connection: each socket gets a fresh challenge and must AUTH against it; the
+proven pubkey lives only for that connection (a reconnect must AUTH again).
 
-> **Synthesized events are unsigned.** The search index stores indexed profile fields, not
-> the original signed `kind:0` events, so the events we emit have `sig: ""` and extra
-> `relevance` / `quality_score` / `documentid` tags. Treat them as search hits / profile
-> cards, not as verifiable relay events.
-
-## Authentication & the backend
-
-NIP-42 proves to *the relay* that the client controls a pubkey. The backend JWT is then
-obtained by forwarding the signed event to:
-
-```
-POST {BACKEND_BASE_URL}/authChallenge/{pubkey}/verify
-{ "signed_event": <the NIP-42 kind-22242 event> }   ->   { "data": { "token": "<JWT>" } }
-```
-
-**Backend requirement:** the relay issues the NIP-42 challenge (per spec), so the backend
-must validate the event **statelessly — like its NIP-98 interface** — i.e. by signature +
-freshness (and, if desired, the `relay` tag), *without* requiring a server-issued challenge
-or the `t=brainstorm_login` tag. Until the backend accepts the NIP-42 event, authentication
-returns `["OK", id, false, "restricted: ..."]` and clients still get anonymous results.
+> **Synthesized events are unsigned.** Vespa stores indexed profile fields, not the original
+> signed `kind:0` events, so the events we emit have `sig: ""` and extra
+> `relevance` / `quality_score` / `documentid` tags. Treat them as search hits / profile cards,
+> not as verifiable relay events.
 
 ## Configuration
 
@@ -79,14 +63,16 @@ All via environment variables (defaults target staging and work out of the box):
 | Variable | Default | Purpose |
 |---|---|---|
 | `RELAY_HOST` / `RELAY_PORT` | `0.0.0.0` / `8080` | Bind address |
-| `BACKEND_BASE_URL` | `https://brainstormserver-staging.nosfabrica.com` | Search backend |
-| `BACKEND_TOKEN_HEADER` | `access_token` | Header carrying the JWT on search calls |
-| `BACKEND_ONLY_RANKED` | `true` | Pass-through of the backend `onlyRanked` flag |
-| `RELAY_PUBLIC_URLS` | _(empty)_ | Comma-separated URLs accepted in the NIP-42 `relay` tag; empty disables the check |
+| `VESPA_URL` | `http://localhost:8081` | Base URL of the Vespa container to query |
+| `DEFAULT_OBSERVER_PUBKEY` | `be7bf5…420d0a` | Observer (hex) used to rank results for anonymous connections |
+| `ONLY_RANKED` | `true` | Drop results with a zero quality_score from the observer's perspective |
+| `RELAY_URL` | `wss://nostr-search.relay/` | This relay's URL, enforced as the NIP-42 `relay` tag |
 | `MAX_RESULTS` | `100` | Cap on hits returned per filter |
 | `WS_MAX_FRAME_BYTES` | `131072` | Max inbound frame size |
-| `BACKEND_MAX_CONNECTIONS` / `_PER_ROUTE` | `2000` / `1000` | Backend HTTP pool sizing |
-| `BACKEND_REQUEST_TIMEOUT_MS` | `15000` | Backend call timeout |
+| `VESPA_MAX_CONNECTIONS` / `_PER_ROUTE` | `2000` / `1000` | Vespa HTTP pool sizing |
+| `VESPA_REQUEST_TIMEOUT_MS` | `15000` | Vespa call timeout |
+
+> The relay needs network reachability to the Vespa container (same as the brainstorm server).
 
 ## Build, test, run
 
@@ -104,8 +90,8 @@ curl localhost:8080/metrics      # relay_live_connections <n>
 Docker:
 
 ```bash
-docker build -t nostr-search-redirector .
-docker run -p 8080:8080 -e BACKEND_BASE_URL=... nostr-search-redirector
+docker build -t nostr-search-relay .
+docker run -p 8080:8080 -e VESPA_URL=http://vespa:8081 -e RELAY_URL=wss://your.relay/ nostr-search-relay
 ```
 
 ## Design notes
@@ -119,17 +105,20 @@ docker run -p 8080:8080 -e BACKEND_BASE_URL=... nostr-search-redirector
   `EVENT…` → `EOSE`, `OK`/`CLOSED`, and message/subscription limits. The app supplies just two
   small pieces (see `RelayServer.kt`):
   - an `EventSource` (`SearchSource`) whose `events(ctx, filters)` parses the filter with
-    `SearchQuery` (NIP-50), redirects to the backend, and emits the hits as `Event`s. It reads
-    the connection's JWT off `ctx.policy` to choose `ownPubkey=true/false`; and
-  - a `FullAuthPolicy` subclass (`BrainstormAuthPolicy`) — Quartz does the NIP-42 challenge +
-    signature/challenge/relay verification; we override the suspend `authorize` hook to swap the
-    verified event for a JWT (held on the policy), and `accept(ReqCmd)` to allow anonymous search.
+    `SearchQuery` (NIP-50) and queries Vespa. It reads the observer pubkey from
+    `ctx.authenticatedUsers` (the NIP-42 pubkey) or falls back to the default observer; and
+  - a `FullAuthPolicy` subclass (`SearchAuthPolicy`) — Quartz does the entire NIP-42 handshake
+    and tracks the authenticated pubkey; we only override `accept(ReqCmd)` to allow anonymous
+    search. There is nothing else to add, because the observer needs no token.
   So the whole Ktor handler is `server.serve(send) { s -> for (f in incoming) s.receive(f.text) }`.
+- **Vespa query** (`VespaQuery` / `VespaClient`) is a faithful port of the brainstorm server's
+  `app/core/vespa.py` — same YQL, rank profile and `user_q` observer feature — verified
+  byte-for-byte against the Python in `VespaQueryTest`.
 - Quartz is pulled from **amethyst `main` via JitPack** (`com.github.vitorpamplona.amethyst:quartz`,
   pinned to a commit). It's a Kotlin Multiplatform library whose JVM variant transitively needs
   `androidx.sqlite`, so the build adds Google's Maven repo (`google()`) and the JitPack repo, and
   requires Kotlin 2.3.x (Quartz's metadata is compiled with 2.3.0).
-- A shared Ktor CIO HTTP client pools connections to the backend across all sockets.
+- A shared Ktor CIO HTTP client pools connections to Vespa across all sockets.
 
 ### Quartz friction
 

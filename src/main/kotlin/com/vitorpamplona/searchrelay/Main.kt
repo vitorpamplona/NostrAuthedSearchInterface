@@ -1,6 +1,6 @@
 package com.vitorpamplona.searchrelay
 
-import com.vitorpamplona.searchrelay.backend.BrainstormClient
+import com.vitorpamplona.searchrelay.backend.VespaClient
 import io.ktor.server.application.Application
 import io.ktor.server.application.install
 import io.ktor.server.engine.embeddedServer
@@ -16,10 +16,10 @@ private val log = LoggerFactory.getLogger("com.vitorpamplona.searchrelay.Main")
 
 fun main() {
     val config = Config()
-    val backend = BrainstormClient(config)
-    val relay = RelayServer(config, backend)
+    val vespa = VespaClient(config)
+    val relay = RelayServer(config, vespa)
 
-    log.info("Starting Nostr search relay on {}:{} -> backend {}", config.host, config.port, config.backendBaseUrl)
+    log.info("Starting Nostr search relay on {}:{} -> vespa {}", config.host, config.port, config.vespaUrl)
 
     val server = embeddedServer(
         Netty,
@@ -32,7 +32,7 @@ fun main() {
     Runtime.getRuntime().addShutdownHook(Thread {
         log.info("Shutting down…")
         relay.close()
-        backend.close()
+        vespa.close()
     })
 
     server.start(wait = true)
