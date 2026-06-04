@@ -114,37 +114,28 @@ docker run -p 8080:8080 -e BACKEND_BASE_URL=... nostr-search-redirector
   is a one-shot non-blocking backend call — there are no long-lived subscriptions to track,
   so idle connections are cheap and the service holds many thousands of sockets.
 - **Nostr:** the entire protocol layer is **Quartz**'s relay-server engine — we don't hand-roll
-  any of it. Each WebSocket creates a Quartz `RelaySession` that drives the whole protocol
-  (NIP-42 challenge on connect, `REQ` → `EVENT…` → `EOSE`, `OK`/`CLOSED`, message/sub limits).
-  The app supplies just two small pieces (see `RelayServer.kt`):
-  - an `EventSource` (`SearchSource`) whose `events(filters)` parses the filter with
-    `SearchQuery` (NIP-50), redirects to the backend, and emits the hits as `Event`s; and
+  any of it. A single `EventSourceServer` (shared `SearchSource` + a per-connection policy
+  factory) drives the whole protocol via `serve()`: NIP-42 challenge on connect, `REQ` →
+  `EVENT…` → `EOSE`, `OK`/`CLOSED`, and message/subscription limits. The app supplies just two
+  small pieces (see `RelayServer.kt`):
+  - an `EventSource` (`SearchSource`) whose `events(ctx, filters)` parses the filter with
+    `SearchQuery` (NIP-50), redirects to the backend, and emits the hits as `Event`s. It reads
+    the connection's JWT off `ctx.policy` to choose `ownPubkey=true/false`; and
   - a `FullAuthPolicy` subclass (`BrainstormAuthPolicy`) — Quartz does the NIP-42 challenge +
     signature/challenge/relay verification; we override the suspend `authorize` hook to swap the
-    verified event for a JWT, and `accept(ReqCmd)` to allow anonymous search.
-  So the Ktor handler is essentially `for (frame in incoming) session.receive(frame.text)`.
+    verified event for a JWT (held on the policy), and `accept(ReqCmd)` to allow anonymous search.
+  So the whole Ktor handler is `server.serve(send) { s -> for (f in incoming) s.receive(f.text) }`.
 - Quartz is pulled from **amethyst `main` via JitPack** (`com.github.vitorpamplona.amethyst:quartz`,
   pinned to a commit). It's a Kotlin Multiplatform library whose JVM variant transitively needs
   `androidx.sqlite`, so the build adds Google's Maven repo (`google()`) and the JitPack repo, and
   requires Kotlin 2.3.x (Quartz's metadata is compiled with 2.3.0).
 - A shared Ktor CIO HTTP client pools connections to the backend across all sockets.
 
-### Quartz friction (things that would make a relay like this leaner still)
+### Quartz friction
 
-The new engine removed most of the code, but a few rough edges remain for an auth-scoped
-redirector:
-
-1. **`EventSource.events(filters)` gets no per-connection/auth context.** A redirector needs the
-   connection's authenticated identity/JWT to set `ownPubkey`, but `EventSource` is a single
-   shared object. So instead of the one-liner `EventSourceServer.serve()`, we construct a
-   `RelaySession` per socket with a per-connection `EventSource` + policy sharing a
-   `ConnectionAuth` holder. Passing the session (or its policy/auth set) into `events()` would
-   let the simple shared-server path work.
-2. **`FullAuthPolicy` requires auth for `REQ`.** For "anonymous allowed, auth optional" relays we
-   had to override `accept(ReqCmd)`. A challenge-issuing-but-non-gating policy variant would fit
-   search/redirector use cases out of the box.
-3. **NIP-77 plumbing is mandatory.** `RelaySession` requires `NegentropySettings` even though a
-   redirector stores nothing; an opt-out default would simplify.
-4. **`RelaySession` wiring is manual** (CoroutineScope + id + `send`/`onClose`), and the `send`
-   sink is a non-suspend `(String) -> Unit` (forcing `trySend`, with backpressure risk). A small
-   transport adapter and/or a suspend send hook would remove the boilerplate.
+The headline gap — **`EventSource` had no per-connection/auth context** — is now **fixed**
+upstream: `events(ctx, filters)` receives a `RequestContext` exposing the connection's
+`policy`/`authenticatedUsers`, so the per-connection auth holder and the manual `RelaySession`
+wiring are gone, and this uses the plain `EventSourceServer.serve()` path. Minor remaining
+nits: `FullAuthPolicy` gates `REQ` (we override `accept(ReqCmd)` to allow anonymous search), and
+`NegentropySettings` is required even though this relay stores nothing.

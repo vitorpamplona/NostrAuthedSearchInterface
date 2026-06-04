@@ -31,6 +31,7 @@ fun main() {
 
     Runtime.getRuntime().addShutdownHook(Thread {
         log.info("Shutting down…")
+        relay.close()
         backend.close()
     })
 

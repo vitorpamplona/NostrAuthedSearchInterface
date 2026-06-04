@@ -35,7 +35,7 @@ dependencies {
 
     // Nostr toolkit — Quartz built from amethyst main via JitPack, which ships the new
     // relay-server engine + Flow<Event> REQ-responder. Brings its secp256k1 backend with it.
-    implementation("com.github.vitorpamplona.amethyst:quartz:3db3037f92")
+    implementation("com.github.vitorpamplona.amethyst:quartz:56240c10d2")
 
     // Logging
     implementation("ch.qos.logback:logback-classic:1.5.12")
