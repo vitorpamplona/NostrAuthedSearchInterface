@@ -35,7 +35,9 @@ Everything else (`EVENT` publishing, other filters, subscriptions) is intentiona
 3. The **observer** — Vespa's `ranking.features.query(user_q) = {<pubkey>:1.0}`, which selects
    that observer's cell in each doc's `quality_scores` tensor — is:
    - the **default observer** for anonymous connections, or
-   - the connection's **NIP-42-authenticated pubkey** once it has AUTH'd.
+   - **every pubkey the connection authenticated** via NIP-42. `user_q` is a weighted set, so
+     multiple observers (`{p1:1.0,p2:1.0}`) rank by the *combined* trust scores — and NIP-42
+     lets one connection AUTH several pubkeys.
 4. To authenticate, the client replies with `["AUTH", <signed kind-22242 event>]` carrying the
    `challenge` and `relay` tags. Quartz verifies the BIP-340 signature, challenge and relay tag.
 

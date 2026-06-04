@@ -51,7 +51,7 @@ class VespaQueryTest {
 
     @Test
     fun `search params carry the observer as the user_q ranking feature`() {
-        val params = VespaQuery.searchParams("vitor pamplona", observer = "abc123", hits = 100, includeZeroScore = false)
+        val params = VespaQuery.searchParams("vitor pamplona", listOf("abc123"), hits = 100, includeZeroScore = false)
         val map = params.toMap()
         assertEquals("name_and_quality_score_only", map["ranking"])
         assertEquals("{abc123:1.0}", map["ranking.features.query(user_q)"])
@@ -64,8 +64,16 @@ class VespaQueryTest {
     }
 
     @Test
+    fun `multiple observers become a combined user_q weighted set (sorted, deduplicated)`() {
+        assertEquals("{aaa:1.0,bbb:1.0}", VespaQuery.userQ(listOf("bbb", "aaa", "bbb")))
+        assertEquals("{only:1.0}", VespaQuery.userQ(listOf("only")))
+        val map = VespaQuery.searchParams("vitor", listOf("p2", "p1"), hits = 10, includeZeroScore = true).toMap()
+        assertEquals("{p1:1.0,p2:1.0}", map["ranking.features.query(user_q)"])
+    }
+
+    @Test
     fun `short word raises the w_gram weight`() {
-        val map = VespaQuery.searchParams("ab", observer = "x", hits = 50, includeZeroScore = true).toMap()
+        val map = VespaQuery.searchParams("ab", listOf("x"), hits = 50, includeZeroScore = true).toMap()
         assertEquals("20.0", map["ranking.features.query(w_gram)"]) // shortest <= 3
         assertEquals("50", map["hits"]) // include-zero: max(50,20) capped at 400
     }

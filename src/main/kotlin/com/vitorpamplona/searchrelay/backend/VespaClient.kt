@@ -43,13 +43,13 @@ class VespaClient(private val config: Config) : AutoCloseable {
     }
 
     /**
-     * Free-text profile search ranked from `observer`'s perspective (Vespa rank profile
-     * [VespaQuery.RANK_PROFILE]). `observer` is a hex pubkey — for an authenticated connection
-     * its own NIP-42 pubkey, otherwise the relay's default observer.
+     * Free-text profile search ranked from one or more observers' perspective (Vespa rank
+     * profile [VespaQuery.RANK_PROFILE]). `observers` are hex pubkeys — every pubkey the
+     * connection authenticated via NIP-42, or the relay's single default observer when anonymous.
      */
-    suspend fun search(text: String, observer: String, hits: Int, includeZeroScore: Boolean): List<Event> {
+    suspend fun search(text: String, observers: Collection<String>, hits: Int, includeZeroScore: Boolean): List<Event> {
         val response = http.get("${config.vespaUrl}/search/") {
-            VespaQuery.searchParams(text, observer, hits, includeZeroScore).forEach { (k, v) ->
+            VespaQuery.searchParams(text, observers, hits, includeZeroScore).forEach { (k, v) ->
                 url.parameters.append(k, v)
             }
         }

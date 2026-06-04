@@ -16,7 +16,7 @@ object VespaQuery {
     private const val GRAM = 3
 
     /** Builds the full set of GET query parameters for a free-text search. */
-    fun searchParams(text: String, observer: String, hits: Int, includeZeroScore: Boolean): List<Pair<String, String>> {
+    fun searchParams(text: String, observers: Collection<String>, hits: Int, includeZeroScore: Boolean): List<Pair<String, String>> {
         val words = text.split(WHITESPACE).filter { it.isNotEmpty() }.take(MAX_QUERY_WORDS)
         val joined = if (words.size >= 2) words.joinToString("") else null
         val shortest = words.minOfOrNull { it.length } ?: text.length
@@ -29,7 +29,7 @@ object VespaQuery {
         val params = mutableListOf(
             "yql" to buildYql(words, joined),
             "ranking" to RANK_PROFILE,
-            "ranking.features.query(user_q)" to "{$observer:1.0}",
+            "ranking.features.query(user_q)" to userQ(observers),
             "ranking.features.query(w_gram)" to wGram.toString(),
             "ranking.features.query(w_about)" to "0.5",
             "ranking.features.query(w_about_bonus)" to "0.0",
@@ -39,6 +39,15 @@ object VespaQuery {
         joined?.let { params.add("wj" to it) }
         return params
     }
+
+    /**
+     * The `user_q` weighted set selecting one or more observer cells of the `quality_scores`
+     * tensor — `{p:1.0}` for a single observer, `{p1:1.0,p2:1.0}` to rank from the combined
+     * perspective of several (e.g. every pubkey a connection authenticated via NIP-42). Sorted
+     * for a deterministic, deduplicated query.
+     */
+    fun userQ(observers: Collection<String>): String =
+        observers.toSortedSet().joinToString(separator = ",", prefix = "{", postfix = "}") { "$it:1.0" }
 
     /** Per-word groups OR'd together, plus an optional joined-CamelCase variant. */
     fun buildYql(words: List<String>, joined: String?): String {

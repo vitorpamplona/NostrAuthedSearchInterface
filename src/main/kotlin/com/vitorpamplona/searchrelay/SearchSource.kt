@@ -25,7 +25,9 @@ class SearchSource(
     private val maxResults: Int,
 ) : EventSource {
     override fun events(ctx: RequestContext, filters: List<Filter>): Flow<Event> = flow {
-        val observer = ctx.authenticatedUsers.firstOrNull() ?: defaultObserver
+        // Every pubkey this connection authenticated via NIP-42 becomes an observer; their
+        // quality scores are combined when ranking. Anonymous → the single default observer.
+        val observers = ctx.authenticatedUsers.ifEmpty { setOf(defaultObserver) }
 
         for (filter in filters) {
             val text = filter.search?.let { sanitize(SearchQuery.parse(it).terms) } ?: continue
@@ -35,7 +37,7 @@ class SearchSource(
             val hex = text.takeIf(HEX_PUBKEY::matches)?.lowercase()
             val results =
                 if (hex != null) listOfNotNull(vespa.getDocument(hex))
-                else vespa.search(text, observer, hits = limit, includeZeroScore = !onlyRanked)
+                else vespa.search(text, observers, hits = limit, includeZeroScore = !onlyRanked)
 
             results.take(limit).forEach { emit(it) }
         }
